@@ -12,6 +12,8 @@ mod keymap;
 mod net;
 mod paintable;
 mod recent;
+#[cfg(target_os = "macos")]
+mod shortcuts;
 mod theme;
 
 use std::cell::{Cell, RefCell};
@@ -1529,6 +1531,19 @@ fn track_key(ui: &App, code: u32, pressed: bool) -> bool {
     }
 }
 
+/// Send a key event to the remote unless `track_key` filters it out.
+fn forward_key(ui: &App, code: u32, pressed: bool) {
+    if track_key(ui, code, pressed) {
+        send(
+            ui,
+            ClientMsg::Key {
+                keycode: code,
+                pressed,
+            },
+        );
+    }
+}
+
 fn install_input_handlers(
     ui: &Rc<App>,
     video: &gtk::Widget,
@@ -1559,15 +1574,7 @@ fn install_input_handlers(
                 return glib::Propagation::Stop;
             };
             tracing::debug!(code, "key pressed");
-            if track_key(&ui, code, true) {
-                send(
-                    &ui,
-                    ClientMsg::Key {
-                        keycode: code,
-                        pressed: true,
-                    },
-                );
-            }
+            forward_key(&ui, code, true);
             glib::Propagation::Stop
         });
     }
@@ -1578,18 +1585,23 @@ fn install_input_handlers(
                 return;
             };
             tracing::debug!(code, "key released");
-            if track_key(&ui, code, false) {
-                send(
-                    &ui,
-                    ClientMsg::Key {
-                        keycode: code,
-                        pressed: false,
-                    },
-                );
-            }
+            forward_key(&ui, code, false);
         });
     }
     video.add_controller(key);
+
+    // Keys with Command held come from the event tap on macOS.
+    #[cfg(target_os = "macos")]
+    {
+        let ui = ui.clone();
+        let mut taken = shortcuts::spawn();
+        glib::spawn_future_local(async move {
+            while let Some((code, pressed)) = taken.recv().await {
+                tracing::debug!(code, pressed, "key from the shortcut tap");
+                forward_key(&ui, code, pressed);
+            }
+        });
+    }
 
     // Pointer motion, and the capture itself: the remote gets the keyboard
     // only while the pointer is over the picture, so the header bar and
@@ -1704,6 +1716,8 @@ fn install_input_handlers(
         };
         focus.connect_enter(move |_| {
             tracing::debug!("video focused; inhibiting system shortcuts");
+            #[cfg(target_os = "macos")]
+            shortcuts::set_capturing(window.is_active());
             if let Some(toplevel) = window.surface().and_downcast::<gdk::Toplevel>() {
                 toplevel.inhibit_system_shortcuts(None::<&gdk::Event>);
                 // The compositor answers asynchronously, and may refuse.
@@ -1726,6 +1740,8 @@ fn install_input_handlers(
         let ui = ui.clone();
         focus.connect_leave(move |_| {
             tracing::debug!("video unfocused; restoring system shortcuts");
+            #[cfg(target_os = "macos")]
+            shortcuts::set_capturing(false);
             release_pressed_keys(&ui);
             if let Some(toplevel) = window.surface().and_downcast::<gdk::Toplevel>() {
                 toplevel.restore_system_shortcuts();
@@ -1733,6 +1749,18 @@ fn install_input_handlers(
         });
     }
     video.add_controller(focus);
+
+    // On macOS the picture keeps its focus while another app is in front, so
+    // the tap also follows the window's activation.
+    #[cfg(target_os = "macos")]
+    {
+        let video = video.clone();
+        window.connect_is_active_notify(move |w| {
+            let focused = gtk::prelude::GtkWindowExt::focus(w).is_some_and(|f| f == video);
+            tracing::debug!(active = w.is_active(), focused, "window activation");
+            shortcuts::set_capturing(w.is_active() && focused);
+        });
+    }
 }
 
 /// In fullscreen the header leaves the layout, so the picture gets the whole
