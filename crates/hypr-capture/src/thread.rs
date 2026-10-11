@@ -1,12 +1,13 @@
 //! The capture thread: Wayland dispatch, buffer ring, session state machine.
 
 use std::fs::File;
-use std::os::fd::AsFd;
+use std::os::fd::{AsFd, OwnedFd};
 use std::sync::{Arc, Mutex};
 
 use calloop::channel::{self, Sender};
 use drm_fourcc::{DrmFourcc, DrmModifier};
 use gbm::{BufferObjectFlags, Device};
+use nix::sys::memfd::{memfd_create, MFdFlags};
 use wayland_client::globals::GlobalListContents;
 use wayland_client::protocol::wl_buffer::WlBuffer;
 use wayland_client::protocol::wl_callback::{self, WlCallback};
@@ -14,7 +15,7 @@ use wayland_client::protocol::wl_output::{self, WlOutput};
 use wayland_client::protocol::wl_pointer::WlPointer;
 use wayland_client::protocol::wl_registry::WlRegistry;
 use wayland_client::protocol::wl_seat::{self, WlSeat};
-use wayland_client::protocol::wl_shm::WlShm;
+use wayland_client::protocol::wl_shm::{self, WlShm};
 use wayland_client::protocol::wl_shm_pool::WlShmPool;
 use wayland_client::{delegate_noop, Connection, Dispatch, QueueHandle};
 use wayland_protocols::ext::image_capture_source::v1::client::ext_image_capture_source_v1::ExtImageCaptureSourceV1;
@@ -36,8 +37,8 @@ use wayland_protocols::wp::linux_dmabuf::zv1::client::zwp_linux_dmabuf_v1::ZwpLi
 
 use crate::cursor::ShmBuffer;
 use crate::{
-    CaptureBuffer, CaptureConfig, CaptureEvent, CapturedFrame, DmabufInfo, Error, EventSink,
-    OutputInfo, Plane, Rect, Result,
+    Backing, CaptureBuffer, CaptureConfig, CaptureEvent, CapturedFrame, DmabufInfo, Error,
+    EventSink, OutputInfo, Plane, Rect, Result,
 };
 use hypr_wl::{LoopState, Outputs, Seat, Target};
 
@@ -381,7 +382,114 @@ impl State {
         None
     }
 
+    /// True when the CPU reads the frames (`prefer_linear`) but the chosen
+    /// format comes with no linear modifier, as on NVIDIA: GBM cannot map
+    /// the tiled buffers on offer, so the ring goes in wl_shm instead.
+    fn needs_shm(&self) -> bool {
+        let linear = u64::from(DrmModifier::Linear);
+        self.cfg.prefer_linear
+            && self
+                .choose_format()
+                .is_some_and(|(_, mods)| !mods.contains(&linear))
+    }
+
+    /// The wl_shm format to capture into and its DRM fourcc. wl_shm numbers
+    /// the two oldest formats 0 and 1; every other value is the fourcc.
+    fn choose_shm_format(&self) -> Option<(wl_shm::Format, u32)> {
+        const PREFERRED: [(wl_shm::Format, DrmFourcc); 4] = [
+            (wl_shm::Format::Xrgb8888, DrmFourcc::Xrgb8888),
+            (wl_shm::Format::Argb8888, DrmFourcc::Argb8888),
+            (wl_shm::Format::Xbgr8888, DrmFourcc::Xbgr8888),
+            (wl_shm::Format::Abgr8888, DrmFourcc::Abgr8888),
+        ];
+        PREFERRED
+            .into_iter()
+            .find(|(f, _)| self.constraints.shm_formats.contains(&u32::from(*f)))
+            .map(|(f, fourcc)| (f, fourcc as u32))
+    }
+
+    /// The ring in wl_shm memfds; see [`Self::needs_shm`].
+    fn allocate_shm_ring(&mut self) -> Result<()> {
+        self.ring_generation += 1;
+        let shm = self
+            .shm
+            .clone()
+            .ok_or_else(|| Error::Capture("the compositor offers no wl_shm".into()))?;
+        let (shm_format, fourcc) = self.choose_shm_format().ok_or_else(|| {
+            Error::Capture(format!(
+                "no usable shm format offered (got {:x?})",
+                self.constraints.shm_formats
+            ))
+        })?;
+        let (w, h) = (self.constraints.width, self.constraints.height);
+        for slot in self.ring.drain(..) {
+            slot.wl_buffer.destroy();
+        }
+        let stride = w * 4;
+        let size = stride as u64 * h as u64;
+        for index in 0..self.cfg.buffers {
+            let fd = memfd_create(c"gliff-screen", MFdFlags::MFD_CLOEXEC)
+                .map_err(|e| Error::Capture(format!("memfd: {e}")))?;
+            let file = File::from(fd);
+            file.set_len(size)?;
+            let pool = shm.create_pool(file.as_fd(), size as i32, &self.qh, ());
+            let wl_buffer = pool.create_buffer(
+                0,
+                w as i32,
+                h as i32,
+                stride as i32,
+                shm_format,
+                &self.qh,
+                (),
+            );
+            pool.destroy();
+            let buffer = Arc::new(CaptureBuffer {
+                index,
+                generation: self.ring_generation,
+                info: DmabufInfo {
+                    fd: OwnedFd::from(file.try_clone()?),
+                    width: w,
+                    height: h,
+                    fourcc,
+                    modifier: u64::from(DrmModifier::Linear),
+                    planes: vec![Plane { offset: 0, stride }],
+                },
+                backing: Backing::Shm(file),
+            });
+            self.ring.push(RingSlot {
+                buffer,
+                wl_buffer,
+                busy: false,
+            });
+        }
+        let modifier = u64::from(DrmModifier::Linear);
+        self.ring_format = Some((fourcc, modifier));
+        tracing::info!(
+            w,
+            h,
+            format = format!("{shm_format:?}"),
+            buffers = self.cfg.buffers,
+            "no linear dmabuf offered; capture ring allocated in shm"
+        );
+        let output = self
+            .output
+            .as_ref()
+            .map(|(_, i)| i.clone())
+            .unwrap_or_default();
+        self.emit(CaptureEvent::Ready {
+            output,
+            width: w,
+            height: h,
+            fourcc,
+            modifier,
+        });
+        Ok(())
+    }
+
     fn allocate_ring(&mut self) -> Result<()> {
+        if self.needs_shm() {
+            return self.allocate_shm_ring();
+        }
         self.ring_generation += 1;
         let (fourcc, modifiers) = self.choose_format().ok_or_else(|| {
             Error::Capture(format!(
@@ -462,8 +570,10 @@ impl State {
                     modifier,
                     planes,
                 },
-                bo: Mutex::new(bo),
-                device: Arc::clone(&self.device),
+                backing: Backing::Gbm {
+                    bo: Mutex::new(bo),
+                    device: Arc::clone(&self.device),
+                },
             });
             self.ring.push(RingSlot {
                 buffer,

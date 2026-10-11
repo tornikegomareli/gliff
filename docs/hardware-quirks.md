@@ -104,7 +104,9 @@ that probe order, when a new generation fails:
 ## Not yet tested anywhere
 - Intel generations before Panther Lake.
 - NVIDIA has no VA-API encoder; both ends take the CPU tier there. Decode
-  through `nvidia-vaapi-driver` is untried.
+  through `nvidia-vaapi-driver` is untried. Hyprland offers no linear
+  dmabuf for capture there and GBM cannot map the tiled ones, so the
+  capture ring falls back to wl_shm (run on an RTX 4080, driver 610.57).
 - Baseline-profile streams (the CPU tier's output) through the VA-API High
   decode config: radeonsi accepts them, and so does iHD on Panther Lake
   (the e2e cpu-server -> gpu-client case); other drivers are unverified.

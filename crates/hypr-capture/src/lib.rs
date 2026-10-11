@@ -1,10 +1,12 @@
 //! Screen and cursor capture from Hyprland through `ext-image-copy-capture-v1`
-//! into GBM-allocated dmabufs.
+//! into GBM-allocated dmabufs, or into wl_shm memfds where the compositor
+//! offers no dmabuf the CPU can map.
 //!
 //! The capture runs on its own thread with a `calloop` loop; the owner sends
 //! commands through [`Capturer`] and receives [`CaptureEvent`]s through a
 //! callback. No `unsafe`: GBM allocation and mapping use the `gbm` crate's
-//! safe API, and cursor pixels are read from a memfd with `read_at`.
+//! safe API, and shm pixels (screen and cursor) are read from a memfd with
+//! `read_at`.
 
 #![forbid(unsafe_code)]
 
@@ -13,6 +15,7 @@ mod thread;
 
 use std::fs::File;
 use std::os::fd::OwnedFd;
+use std::os::unix::fs::FileExt;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -60,7 +63,9 @@ pub struct CaptureConfig {
     pub render_node: PathBuf,
     /// Ring size; 3 keeps one frame in flight while one is consumed.
     pub buffers: usize,
-    /// Prefer a linear modifier so the CPU can map frames cheaply.
+    /// Prefer a linear modifier so the CPU can map frames cheaply. When the
+    /// compositor offers no linear modifier (NVIDIA), capture into wl_shm
+    /// instead, since GBM cannot map the tiled buffers for the CPU.
     pub prefer_linear: bool,
     /// Also run a cursor session and report shape/position.
     pub cursor: bool,
@@ -114,8 +119,19 @@ pub struct CaptureBuffer {
     /// a release from a pre-resize frame cannot free a current buffer.
     pub generation: u64,
     pub info: DmabufInfo,
-    bo: Mutex<BufferObject<()>>,
-    device: Arc<Mutex<Device<File>>>,
+    backing: Backing,
+}
+
+/// Where a ring buffer's pixels live.
+enum Backing {
+    /// A GBM dmabuf: the GPU tier imports it, the CPU tier maps it.
+    Gbm {
+        bo: Mutex<BufferObject<()>>,
+        device: Arc<Mutex<Device<File>>>,
+    },
+    /// A wl_shm memfd, read back with `read_at`. Only the CPU tier can use
+    /// it.
+    Shm(File),
 }
 
 impl std::fmt::Debug for CaptureBuffer {
@@ -130,12 +146,19 @@ impl std::fmt::Debug for CaptureBuffer {
 impl CaptureBuffer {
     /// Map the whole buffer for CPU reads and run `f(pixels, stride_bytes)`.
     pub fn with_mapped<R>(&self, f: impl FnOnce(&[u8], u32) -> R) -> Result<R> {
-        let device = self
-            .device
+        let (bo, device) = match &self.backing {
+            Backing::Gbm { bo, device } => (bo, device),
+            Backing::Shm(file) => {
+                let stride = self.info.planes[0].stride;
+                let mut pixels = vec![0u8; stride as usize * self.info.height as usize];
+                file.read_exact_at(&mut pixels, 0)?;
+                return Ok(f(&pixels, stride));
+            }
+        };
+        let device = device
             .lock()
             .map_err(|_| Error::Gbm("device mutex poisoned".into()))?;
-        let bo = self
-            .bo
+        let bo = bo
             .lock()
             .map_err(|_| Error::Gbm("buffer mutex poisoned".into()))?;
         let (w, h) = (self.info.width, self.info.height);
