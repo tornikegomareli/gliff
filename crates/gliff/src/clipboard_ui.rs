@@ -198,6 +198,14 @@ pub fn set_remote_offer(
     mime_types: Vec<String>,
     files: Vec<ClipboardFile>,
 ) {
+    // GTK's macOS backend serves a paste by iterating a private main
+    // context while it blocks the default one, but gtk-rs runs a provider's
+    // write future on the default context, so the lazy proxy would hang the
+    // UI. Until macOS has its own bridge, the server's offer is not taken.
+    if cfg!(target_os = "macos") {
+        tracing::debug!("server clipboard offer not taken on macOS");
+        return;
+    }
     let Some(cb) = clipboard() else {
         return;
     };

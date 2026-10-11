@@ -7,6 +7,7 @@
 
 mod clipboard;
 mod clipboard_ui;
+mod keycode;
 mod keymap;
 mod net;
 mod paintable;
@@ -15,6 +16,7 @@ mod theme;
 
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeSet;
+#[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -25,6 +27,7 @@ use adw::prelude::*;
 use clap::Parser;
 use gliff_proto::{Axis, ClientMsg};
 use gliff_transport::SshTarget;
+#[cfg(target_os = "linux")]
 use gliff_vk::DisplayFrame;
 use gtk::gdk;
 use gtk::glib;
@@ -1073,6 +1076,7 @@ fn poll_frames(ui: Rc<App>, s: Rc<Session>, rx: Receiver<Picture>, generation: u
 /// a plain memory texture for the CPU tier.
 fn frame_texture(f: Frame) -> Result<gdk::Texture, glib::Error> {
     match f {
+        #[cfg(target_os = "linux")]
         Frame::Dmabuf(f) => dmabuf_texture(f),
         Frame::Bgra(f) => {
             let bytes = glib::Bytes::from_owned(f.pixels);
@@ -1091,6 +1095,7 @@ fn frame_texture(f: Frame) -> Result<gdk::Texture, glib::Error> {
 /// Wrap a decoded frame's dmabuf as a GDK texture. The frame (and its fd)
 /// lives until GTK releases the texture, which returns the image to the
 /// decoder's ring.
+#[cfg(target_os = "linux")]
 fn dmabuf_texture(f: DisplayFrame) -> Result<gdk::Texture, glib::Error> {
     let display = gdk::Display::default()
         .ok_or_else(|| glib::Error::new(glib::FileError::Failed, "no display"))?;
@@ -1533,7 +1538,7 @@ fn install_input_handlers(
     video.set_focusable(true);
     video.set_can_focus(true);
 
-    // Keyboard: hardware keycode minus 8 is the evdev code. The controller
+    // Keyboard: the hardware keycode maps to an evdev code. The controller
     // runs in the capture phase so that while the picture has the keyboard
     // every key goes to the remote, ahead of any local handling.
     let key = gtk::EventControllerKey::new();
@@ -1550,7 +1555,9 @@ fn install_input_handlers(
                 release_capture(&ui, &window);
                 return glib::Propagation::Stop;
             }
-            let code = keycode.saturating_sub(8);
+            let Some(code) = keycode::evdev(keycode) else {
+                return glib::Propagation::Stop;
+            };
             tracing::debug!(code, "key pressed");
             if track_key(&ui, code, true) {
                 send(
@@ -1567,7 +1574,9 @@ fn install_input_handlers(
     {
         let ui = ui.clone();
         key.connect_key_released(move |_, _keyval, keycode, _state| {
-            let code = keycode.saturating_sub(8);
+            let Some(code) = keycode::evdev(keycode) else {
+                return;
+            };
             tracing::debug!(code, "key released");
             if track_key(&ui, code, false) {
                 send(

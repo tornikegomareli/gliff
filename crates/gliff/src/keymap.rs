@@ -14,6 +14,15 @@ pub type Keymap = watch::Receiver<String>;
 /// server fall back to its default.
 pub const FIRST_KEYMAP_WAIT: Duration = Duration::from_secs(1);
 
+/// Without a Wayland compositor there is no xkb keymap to follow. The sender
+/// drops at once, so the session does not wait for one and the server uses
+/// its own layout.
+#[cfg(not(target_os = "linux"))]
+pub fn watch() -> Keymap {
+    watch::channel(String::new()).1
+}
+
+#[cfg(target_os = "linux")]
 pub fn watch() -> Keymap {
     let (tx, rx) = watch::channel(String::new());
     let sink = Box::new(move |text: String| {

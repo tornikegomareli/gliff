@@ -20,6 +20,7 @@ use gliff_sw::VideoMode;
 use gliff_transport::clipboard::progress::Progress;
 use gliff_transport::clipboard::{outbound_channel, Side, Transfers};
 use gliff_transport::{spawn_ssh, Framed, SshTarget};
+#[cfg(target_os = "linux")]
 use gliff_vk::{Decoder, DisplayFrame, Gpu};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc::{self, unbounded_channel, UnboundedReceiver};
@@ -110,6 +111,7 @@ pub enum Endpoint {
 /// A decoded frame for the GTK thread: a dmabuf from the GPU tier, or plain
 /// BGRA pixels from the CPU tier.
 pub enum Frame {
+    #[cfg(target_os = "linux")]
     Dmabuf(DisplayFrame),
     Bgra(gliff_sw::PooledFrame),
 }
@@ -186,6 +188,7 @@ impl Worker {
 /// The decode pipeline: VA-API and Vulkan compute on the GPU, or OpenH264 on
 /// the CPU.
 enum VideoDecoder {
+    #[cfg(target_os = "linux")]
     Gpu(Box<Decoder>),
     Cpu(Box<gliff_sw::Decoder>),
 }
@@ -193,6 +196,7 @@ enum VideoDecoder {
 /// Open the GPU for decoding, or `None` for the CPU tier. In `Gpu` mode a
 /// machine without Vulkan compute or a VA-API H.264 decoder falls back to
 /// the CPU.
+#[cfg(target_os = "linux")]
 fn open_gpu(mode: VideoMode) -> Option<Arc<Gpu>> {
     if mode == VideoMode::Cpu {
         tracing::info!("using the CPU video pipeline as requested");
@@ -211,6 +215,7 @@ fn open_gpu(mode: VideoMode) -> Option<Arc<Gpu>> {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn new_decoder(
     gpu: &Option<Arc<Gpu>>,
     chroma: ChromaMode,
@@ -229,9 +234,31 @@ fn new_decoder(
     Ok(VideoDecoder::Cpu(Box::new(gliff_sw::Decoder::new(dual)?)))
 }
 
+/// There is no GPU tier off Linux yet.
+#[cfg(not(target_os = "linux"))]
+type Gpu = std::convert::Infallible;
+
+#[cfg(not(target_os = "linux"))]
+fn open_gpu(_mode: VideoMode) -> Option<Arc<Gpu>> {
+    tracing::info!("using the CPU video pipeline: no GPU tier on this platform");
+    None
+}
+
+#[cfg(not(target_os = "linux"))]
+fn new_decoder(
+    _gpu: &Option<Arc<Gpu>>,
+    chroma: ChromaMode,
+    _width: u32,
+    _height: u32,
+) -> anyhow::Result<VideoDecoder> {
+    let dual = chroma != ChromaMode::Single420;
+    Ok(VideoDecoder::Cpu(Box::new(gliff_sw::Decoder::new(dual)?)))
+}
+
 impl VideoDecoder {
     fn label(&self) -> &'static str {
         match self {
+            #[cfg(target_os = "linux")]
             Self::Gpu(_) => "GPU",
             Self::Cpu(_) => "CPU",
         }
@@ -349,6 +376,7 @@ where
         fps_cap,
     });
     let decode_on = match (&decoder, &gpu) {
+        #[cfg(target_os = "linux")]
         (VideoDecoder::Gpu(_), Some(g)) => g.name.as_str(),
         _ => "cpu",
     };
@@ -454,6 +482,7 @@ where
     let pool = gliff_sw::PixelPool::default();
     // Geometry of the picture the GPU decoder holds, for a redraw: a
     // geometry-only StreamConfig may have moved `view` on since.
+    #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
     let mut last_gpu_geometry: Option<Geometry> = None;
     loop {
         let read = tokio::select! {
@@ -468,6 +497,7 @@ where
                 // at the new zoom now. The CPU tier has no copy to redraw
                 // and asks for a keyframe instead.
                 let redrawn = match &mut decoder {
+                    #[cfg(target_os = "linux")]
                     VideoDecoder::Gpu(d) => match d.set_zoom(zoom).and_then(|_| d.redraw()) {
                         Ok(frame) => {
                             tracing::info!(zoom = d.zoom(), "decoder output zoom");
@@ -532,6 +562,7 @@ where
                                 None
                             }
                         },
+                        #[cfg(target_os = "linux")]
                         VideoDecoder::Gpu(_) => None,
                     },
                 };
@@ -569,6 +600,7 @@ where
                 in_decoder.push_back(((width, height), view, scale_milli));
                 let t0 = std::time::Instant::now();
                 let decoded = match &mut decoder {
+                    #[cfg(target_os = "linux")]
                     VideoDecoder::Gpu(d) => {
                         // A decoder made by a StreamConfig starts at zoom 1.
                         if d.zoom() != zoom {
@@ -611,6 +643,7 @@ where
                             in_decoder
                                 .pop_front()
                                 .unwrap_or(((width, height), view, scale_milli));
+                        #[cfg(target_os = "linux")]
                         if matches!(frame, Frame::Dmabuf(_)) {
                             last_gpu_geometry = Some((stream, pic_view, pic_scale));
                         }
@@ -635,6 +668,7 @@ where
                         // picture means this access unit produced none, so
                         // its geometry entry goes with it. The CPU decoder
                         // holds it (drained later or by the next decode).
+                        #[cfg(target_os = "linux")]
                         if matches!(decoder, VideoDecoder::Gpu(_)) {
                             in_decoder.pop_front();
                         }
