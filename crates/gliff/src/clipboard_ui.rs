@@ -1,7 +1,9 @@
 //! The GTK thread's half of the clipboard: watches the local `gdk::Clipboard`
 //! for changes to offer to the server, reads a local item when the server
 //! requests one, and proxies the server's offer as a lazy content provider
-//! whose bytes are fetched only when an application pastes.
+//! whose bytes are fetched only when an application pastes. On macOS the
+//! server's text or image is copied in at once instead (see
+//! `set_remote_offer`).
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -20,8 +22,8 @@ use tokio::sync::mpsc::{Sender, UnboundedSender, WeakUnboundedSender};
 use tokio::sync::oneshot;
 
 use gliff_proto::clipboard::{
-    forwardable_mimes, is_file_mime, local_mimes_for_offer, offers_files, parse_uri_list,
-    resolve_mime, CHUNK,
+    forwardable_mimes, is_file_mime, is_text_mime, local_mimes_for_offer, offers_files,
+    parse_uri_list, resolve_mime, CHUNK, TEXT_MIME,
 };
 use gliff_proto::ClipboardFile;
 use gliff_transport::clipboard::files::{list_files, LocalFiles};
@@ -32,12 +34,23 @@ use crate::clipboard::ToWorker;
 /// Longest `text/uri-list` we read to build an offer.
 const URI_LIST_MAX: usize = 1024 * 1024;
 
+const PNG_MIME: &str = "image/png";
+
+thread_local! {
+    /// The provider of the last server item copied in on macOS.
+    static COPIED: RefCell<Option<gdk::ContentProvider>> = const { RefCell::new(None) };
+    /// Counts the server's offers, so a slow copy does not replace a newer
+    /// offer.
+    static OFFERS: Cell<u64> = const { Cell::new(0) };
+}
+
 fn clipboard() -> Option<gdk::Clipboard> {
     gdk::Display::default().map(|d| d.clipboard())
 }
 
 fn holds_remote_offer(cb: &gdk::Clipboard) -> bool {
-    cb.content().is_some_and(|p| p.is::<RemoteProvider>())
+    cb.content()
+        .is_some_and(|p| p.is::<RemoteProvider>() || COPIED.with_borrow(|c| c.as_ref() == Some(&p)))
 }
 
 /// Report every change of the local clipboard to the workers, except changes
@@ -198,14 +211,7 @@ pub fn set_remote_offer(
     mime_types: Vec<String>,
     files: Vec<ClipboardFile>,
 ) {
-    // GTK's macOS backend serves a paste by iterating a private main
-    // context while it blocks the default one, but gtk-rs runs a provider's
-    // write future on the default context, so the lazy proxy would hang the
-    // UI. Until macOS has its own bridge, the server's offer is not taken.
-    if cfg!(target_os = "macos") {
-        tracing::debug!("server clipboard offer not taken on macOS");
-        return;
-    }
+    OFFERS.set(OFFERS.get() + 1);
     let Some(cb) = clipboard() else {
         return;
     };
@@ -216,10 +222,86 @@ pub fn set_remote_offer(
         }
         return;
     }
+    // GTK's macOS backend serves a paste by iterating a private main
+    // context while it blocks the default one, but gtk-rs runs a provider's
+    // write future on the default context, so the lazy proxy would hang the
+    // UI.
+    if cfg!(target_os = "macos") {
+        copy_remote_offer(&cb, tx, serial, &mimes);
+        return;
+    }
     let provider = RemoteProvider::new(tx.downgrade(), serial, mimes);
     if let Err(e) = cb.set_content(Some(&provider)) {
         tracing::warn!(error = %e, "clipboard proxy not set");
     }
+}
+
+/// Fetch the server's text, or else its PNG, and put it on the clipboard
+/// as a GTK value provider, which GTK writes on its private context. Files
+/// and other types are not copied.
+fn copy_remote_offer(
+    cb: &gdk::Clipboard,
+    tx: &UnboundedSender<ToWorker>,
+    serial: u32,
+    mimes: &[String],
+) {
+    let Some(mime) = resolve_mime(TEXT_MIME, mimes)
+        .or_else(|| resolve_mime(PNG_MIME, mimes))
+        .map(str::to_string)
+    else {
+        tracing::debug!(?mimes, "server clipboard has no text or PNG to copy");
+        return;
+    };
+    let (sink, mut chunks) = tokio::sync::mpsc::channel::<Bytes>(2);
+    let (result, done) = oneshot::channel();
+    let fetch = ToWorker::Fetch {
+        mime_type: mime.clone(),
+        serial,
+        sink,
+        result,
+    };
+    if tx.send(fetch).is_err() {
+        return;
+    }
+    let offer = OFFERS.get();
+    let cb = cb.clone();
+    glib::MainContext::default().spawn_local(async move {
+        let mut body = Vec::new();
+        while let Some(chunk) = chunks.recv().await {
+            body.extend_from_slice(&chunk);
+        }
+        match done.await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                tracing::warn!(error = %e, "server clipboard not copied");
+                return;
+            }
+            Err(_) => return,
+        }
+        if OFFERS.get() != offer {
+            return;
+        }
+        let value = if is_text_mime(&mime) {
+            String::from_utf8_lossy(&body).to_value()
+        } else {
+            match gdk::Texture::from_bytes(&glib::Bytes::from_owned(body)) {
+                Ok(texture) => texture.to_value(),
+                Err(e) => {
+                    tracing::warn!(error = %e, "server clipboard image not copied");
+                    return;
+                }
+            }
+        };
+        // Recorded first: setting it emits `changed`, which must not offer
+        // the item back to the server.
+        let provider = gdk::ContentProvider::for_value(&value);
+        COPIED.set(Some(provider.clone()));
+        if let Err(e) = cb.set_content(Some(&provider)) {
+            tracing::warn!(error = %e, "server clipboard not copied");
+            return;
+        }
+        tracing::debug!(mime, "server clipboard copied");
+    });
 }
 
 glib::wrapper! {
