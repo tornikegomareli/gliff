@@ -52,6 +52,8 @@ pub enum Status {
     Connected {
         /// "server tier→client tier", e.g. "GPU→CPU".
         video: String,
+        /// The remote output the session shows, e.g. `DP-2`.
+        output: String,
         view_width: u32,
         view_height: u32,
         fps_cap: u32,
@@ -323,10 +325,14 @@ where
     // it before anything else (even GPU setup) so the server's round-trip
     // estimate is seeded ahead of the first frame ack.
     let mut got_ack = false;
+    let mut output = String::new();
     let (mut width, mut height, mut chroma, mut scale_milli, pipeline, mut view, mut fps_cap) = loop {
         match reader.read_msg::<ServerMsg>().await? {
             ServerMsg::HelloAck {
-                version, features, ..
+                version,
+                features,
+                session,
+                ..
             } => {
                 if version != PROTOCOL_VERSION {
                     return Err(
@@ -334,6 +340,7 @@ where
                     );
                 }
                 tracing::debug!(?features, "server features");
+                output = session.output;
                 got_ack = true;
             }
             ServerMsg::Ping { t } => writer.write_msg(&ClientMsg::Pong { t }).await?,
@@ -371,6 +378,7 @@ where
     let mut video_label = tier_label(pipeline, &decoder);
     let _ = status.send(Status::Connected {
         video: video_label.clone(),
+        output: output.clone(),
         view_width: view.0,
         view_height: view.1,
         fps_cap,
@@ -704,6 +712,7 @@ where
                 video_label = tier_label(pipeline, &decoder);
                 let _ = status.send(Status::Connected {
                     video: video_label.clone(),
+                    output: output.clone(),
                     view_width,
                     view_height,
                     fps_cap,

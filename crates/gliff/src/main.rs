@@ -9,6 +9,8 @@ mod clipboard;
 mod clipboard_ui;
 mod keycode;
 mod keymap;
+#[cfg(target_os = "macos")]
+mod menubar;
 mod net;
 mod paintable;
 mod recent;
@@ -137,6 +139,9 @@ struct Session {
     /// The tab's name: `user@host`, or the address of a dev `--connect`.
     name: String,
     endpoint: Endpoint,
+    /// A private screen opened from the macOS menu bar, named
+    /// `user@host (private)`. The config does not record it.
+    private: bool,
     input_tx: RefCell<Option<OutSender>>,
     /// Bumped by every `start_session` and by `stop_session`, so pollers and
     /// delayed reconnects of an earlier worker can tell they are stale.
@@ -161,6 +166,8 @@ struct Session {
     server_view: Cell<(u32, u32)>,
     /// The server's frame-rate ceiling, for the stats overlay.
     fps_cap: Cell<u32>,
+    /// The remote output the session shows, e.g. `DP-2`.
+    output: RefCell<String>,
     /// The remote output's scale: pointer coordinates go in physical / scale.
     stream_scale: Cell<f32>,
     /// The size last asked of the server, so a pending resize is not repeated.
@@ -179,6 +186,7 @@ impl Session {
         Self {
             name: machine_name(&endpoint).to_string(),
             endpoint,
+            private: false,
             input_tx: RefCell::new(None),
             generation: Cell::new(0),
             retries: Cell::new(0),
@@ -189,6 +197,7 @@ impl Session {
             stream_view: Cell::new((0, 0)),
             server_view: Cell::new((0, 0)),
             fps_cap: Cell::new(0),
+            output: RefCell::new(String::new()),
             stream_scale: Cell::new(1.0),
             resize_requested: Cell::new((0, 0)),
             zoom: Cell::new(1),
@@ -197,6 +206,12 @@ impl Session {
             status: RefCell::new(String::new()),
             stats: RefCell::new(String::new()),
         }
+    }
+
+    /// True when the config records this session: an ssh machine, but not a
+    /// private screen, whose tab name is not a host.
+    fn in_config(&self) -> bool {
+        matches!(self.endpoint, Endpoint::Ssh(_)) && !self.private
     }
 }
 
@@ -407,6 +422,13 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
     install_resize_handler(&ui);
     install_address_bar(&ui, &connect_btn);
     refresh_tabs(&ui);
+    // On macOS the menu bar item outlives the window: closing the window
+    // hides it, and the sessions keep running for the item's preview.
+    #[cfg(target_os = "macos")]
+    {
+        window.set_hide_on_close(true);
+        menubar::install(&ui);
+    }
 
     // Fullscreen toggle.
     {
@@ -814,7 +836,7 @@ fn show_session(ui: &Rc<App>, s: &Rc<Session>) {
     if !is_active(ui, s) {
         release_pressed_keys(ui);
         *ui.active.borrow_mut() = Some(s.clone());
-        if matches!(s.endpoint, Endpoint::Ssh(_)) {
+        if s.in_config() {
             let mut config = Config::load(&ui.config_path);
             config.shown = Some(s.name.clone());
             save_config(ui, &config);
@@ -866,7 +888,7 @@ fn stop_session(ui: &Rc<App>, name: &str) {
     s.input_tx.borrow_mut().take();
     s.last_frame.borrow_mut().take();
     // A machine stopped by hand stays stopped when the window reopens.
-    if matches!(s.endpoint, Endpoint::Ssh(_)) {
+    if s.in_config() {
         let mut config = Config::load(&ui.config_path);
         config.set_open(&s.name, false);
         save_config(ui, &config);
@@ -916,6 +938,8 @@ fn save_config(ui: &App, config: &Config) {
 /// session has none.
 fn set_status(ui: &App, s: &Rc<Session>, text: &str) {
     *s.status.borrow_mut() = text.to_string();
+    #[cfg(target_os = "macos")]
+    menubar::status(s);
     if is_active(ui, s) {
         show_status(ui, text);
     }
@@ -1006,7 +1030,7 @@ const MAX_RETRIES: u32 = 5;
 /// reconnect when the window opens again, once per session. The connected
 /// status repeats on every stream reconfigure, such as a resize.
 fn remember_machine(ui: &Rc<App>, s: &Session) {
-    if !matches!(s.endpoint, Endpoint::Ssh(_)) || s.remembered.replace(true) {
+    if !s.in_config() || s.remembered.replace(true) {
         return;
     }
     let mut config = Config::load(&ui.config_path);
@@ -1065,6 +1089,8 @@ fn poll_frames(ui: Rc<App>, s: Rc<Session>, rx: Receiver<Picture>, generation: u
                         ui.frame
                             .set_frame(texture.clone(), ui.video.scale_factor(), p.view);
                     }
+                    #[cfg(target_os = "macos")]
+                    menubar::frame(&s, &texture);
                     *s.last_frame.borrow_mut() = Some((texture, p.view));
                 }
                 Err(e) => tracing::warn!(error = %e, "frame texture import failed"),
@@ -1133,10 +1159,12 @@ fn poll_status(ui: Rc<App>, s: Rc<Session>, rx: Receiver<Status>, generation: u6
                 // new config never remaps clicks against the old picture.
                 Status::Connected {
                     video,
+                    output,
                     view_width,
                     view_height,
                     fps_cap,
                 } => {
+                    *s.output.borrow_mut() = output;
                     s.server_view.set((view_width, view_height));
                     s.fps_cap.set(fps_cap);
                     s.resize_requested.set((0, 0));
